@@ -16,6 +16,7 @@ const { ServiceRegistry } = require('./services/serviceRegistry');
 const { CircuitBreaker } = require('./services/circuitBreaker');
 const { RateLimiter } = require('./services/rateLimiter');
 const { createPublicCache } = require('./middleware/publicCache');
+const { openApiSpec } = require('./docs/openapi');
 
 // Load environment variables
 dotenv.config();
@@ -114,6 +115,43 @@ app.use((req, res, next) => {
     }
     next();
 });
+
+// OpenAPI 3 spec + Swagger UI, gated to non-production environments.
+// Served at /api/docs (UI) and /api/docs/openapi.json (raw spec).
+const docsEnabled = process.env.NODE_ENV !== 'production' || process.env.ENABLE_API_DOCS === 'true';
+
+if (docsEnabled) {
+    app.get('/api/docs/openapi.json', (req, res) => {
+        res.json(openApiSpec);
+    });
+
+    app.get('/api/docs', (req, res) => {
+        res.set('Content-Type', 'text/html');
+        res.send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>API Documentation</title>
+    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css" />
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+    <script>
+        window.onload = function () {
+            window.ui = SwaggerUIBundle({
+                url: '/api/docs/openapi.json',
+                dom_id: '#swagger-ui',
+                deepLinking: true,
+                presets: [SwaggerUIBundle.presets.apis],
+            });
+        };
+    </script>
+</body>
+</html>`);
+    });
+}
 
 // Service discovery and health check
 app.use(async (req, res, next) => {
@@ -241,243 +279,10 @@ app.get('/admin/services', async (req, res) => {
         res.status(500).json({
             error: {
                 message: 'Failed to get services',
-                code: 'GET_SERVICES_ERROR'
+                code: 'SERVICES_ERROR'
             }
         });
     }
-});
-
-app.post('/admin/services/:name/instances', async (req, res) => {
-    try {
-        const { name } = req.params;
-        const { url, healthCheckUrl } = req.body;
-        
-        await serviceRegistry.registerInstance(name, {
-            url,
-            healthCheckUrl,
-            healthy: true,
-            registeredAt: new Date()
-        });
-        
-        res.status(201).json({
-            message: `Instance registered for service ${name}`,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(500).json({
-            error: {
-                message: 'Failed to register instance',
-                code: 'REGISTER_INSTANCE_ERROR'
-            }
-        });
-    }
-});
-
-app.delete('/admin/services/:name/instances/:instanceId', async (req, res) => {
-    try {
-        const { name, instanceId } = req.params;
-        
-        await serviceRegistry.deregisterInstance(name, instanceId);
-        
-        res.json({
-            message: `Instance ${instanceId} deregistered for service ${name}`,
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        res.status(500).json({
-            error: {
-                message: 'Failed to deregister instance',
-                code: 'DEREGISTER_INSTANCE_ERROR'
-            }
-        });
-    }
-});
-
-// Circuit breaker management
-app.get('/admin/circuit-breakers', (req, res) => {
-    const breakers = Array.from(circuitBreakers.entries()).map(([name, breaker]) => ({
-        name,
-        state: breaker.getState(),
-        stats: breaker.getStats()
-    }));
-    
-    res.json({
-        breakers,
-        timestamp: new Date().toISOString()
-    });
-});
-
-app.post('/admin/circuit-breakers/:name/reset', (req, res) => {
-    const { name } = req.params;
-    const breaker = circuitBreakers.get(name);
-    
-    if (!breaker) {
-        return res.status(404).json({
-            error: {
-                message: `Circuit breaker ${name} not found`,
-                code: 'CIRCUIT_BREAKER_NOT_FOUND'
-            }
-        });
-    }
-    
-    breaker.reset();
-    
-    res.json({
-        message: `Circuit breaker ${name} reset`,
-        timestamp: new Date().toISOString()
-    });
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Gateway error:', err);
-    
-    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
-        return res.status(503).json({
-            error: {
-                message: 'Service temporarily unavailable',
-                code: 'SERVICE_UNAVAILABLE'
-            }
-        });
-    }
-    
-    res.status(err.status || 500).json({
-        error: {
-            message: err.message || 'Internal server error',
-            code: err.code || 'INTERNAL_ERROR'
-        }
-    });
-});
-
-// 404 handler
-app.use((req, res) => {
-    res.status(404).json({
-        error: {
-            message: 'Route not found',
-            code: 'ROUTE_NOT_FOUND'
-        }
-    });
-});
-
-// Helper functions
-function getServiceNameFromPath(path) {
-    const pathParts = path.split('/').filter(Boolean);
-    
-    if (pathParts.length === 0) return null;
-    
-    // Map path prefixes to service names
-    const serviceMap = {
-        'auth': 'auth-service',
-        'users': 'user-service',
-        'products': 'product-service',
-        'orders': 'order-service',
-        'payments': 'payment-service',
-        'notifications': 'notification-service',
-        'analytics': 'analytics-service',
-        'stats': 'analytics-service',
-        'verify': 'verification-service',
-        'catalog': 'catalog-service'
-    };
-    
-    return serviceMap[pathParts[0]] || null;
-}
-
-function setupServiceProxies(app) {
-    const services = [
-        { name: 'auth-service', path: '/auth' },
-        { name: 'user-service', path: '/users' },
-        { name: 'product-service', path: '/products' },
-        { name: 'order-service', path: '/orders' },
-        { name: 'payment-service', path: '/payments' },
-        { name: 'notification-service', path: '/notifications' },
-        { name: 'analytics-service', path: '/analytics' },
-        { name: 'analytics-service', path: '/stats' },
-        { name: 'verification-service', path: '/verify' },
-        { name: 'catalog-service', path: '/catalog' }
-    ];
-    
-    services.forEach(({ name, path }) => {
-        app.use(path, createProxyMiddleware({
-            target: process.env[`${name.toUpperCase().replace(/-/g, '_')}_URL`] || `http://localhost:${getServicePort(name)}`,
-            changeOrigin: true,
-            pathRewrite: {
-                [`^${path}`]: ''
-            },
-            onProxyReq: (proxyReq, req, res) => {
-                // Add request ID to proxied requests
-                proxyReq.setHeader('x-request-id', req.requestId);
-                
-                // Add service instance info
-                if (req.serviceInstance) {
-                    proxyReq.setHeader('x-service-instance', req.serviceInstance.id);
-                }
-            },
-            onError: (err, req, res) => {
-                console.error(`Proxy error for ${name}:`, err);
-                
-                if (!res.headersSent) {
-                    res.status(503).json({
-                        error: {
-                            message: `Service ${name} is unavailable`,
-                            code: 'SERVICE_UNAVAILABLE'
-                        }
-                    });
-                }
-            }
-        }));
-    });
-}
-
-function getServicePort(serviceName) {
-    const ports = {
-        'auth-service': 3001,
-        'user-service': 3002,
-        'product-service': 3003,
-        'order-service': 3004,
-        'payment-service': 3005,
-        'notification-service': 3006,
-        'analytics-service': 3007,
-        'verification-service': 3008,
-        'catalog-service': 3009
-    };
-    
-    return ports[serviceName] || 3000;
-}
-
-function trackRequestMetrics(req, res, duration) {
-    // Metrics tracking implementation
-    // This would integrate with your metrics system
-}
-
-async function getGatewayMetrics() {
-    // Metrics retrieval implementation
-    // This would integrate with your metrics system
-    return '';
-}
-
-// Start server
-const PORT = process.env.PORT || 8080;
-
-const server = app.listen(PORT, () => {
-    console.log(`API Gateway listening on port ${PORT}`);
-    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-});
-
-// Graceful shutdown
-process.on('SIGTERM', () => {
-    console.log('SIGTERM received, shutting down gracefully');
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
-});
-
-process.on('SIGINT', () => {
-    console.log('SIGINT received, shutting down gracefully');
-    server.close(() => {
-        console.log('Server closed');
-        process.exit(0);
-    });
 });
 
 module.exports = app;
