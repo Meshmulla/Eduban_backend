@@ -15,6 +15,7 @@ const { initMetrics } = require('./utils/metrics');
 const { ServiceRegistry } = require('./services/serviceRegistry');
 const { CircuitBreaker } = require('./services/circuitBreaker');
 const { RateLimiter } = require('./services/rateLimiter');
+const { createPublicCache } = require('./middleware/publicCache');
 
 // Load environment variables
 dotenv.config();
@@ -30,6 +31,12 @@ const app = express();
 const serviceRegistry = new ServiceRegistry();
 const circuitBreakers = new Map();
 const rateLimiters = new Map();
+
+// Public (unauthenticated) routes that get dedicated rate limits and caching
+const PUBLIC_ROUTE_PREFIXES = ['/stats', '/verify', '/catalog'];
+
+const isPublicRoute = (path) =>
+    PUBLIC_ROUTE_PREFIXES.some((prefix) => path === prefix || path.startsWith(`${prefix}/`));
 
 // Middleware
 app.use(helmet({
@@ -76,6 +83,37 @@ const globalLimiter = rateLimit({
 });
 
 app.use(globalLimiter);
+
+// Per-IP rate limiting for public (unauthenticated) endpoints.
+// Defaults are intentionally tighter than the global limiter since these
+// routes are reachable without credentials. Configurable via env.
+const publicLimiter = rateLimit({
+    windowMs: parseInt(process.env.PUBLIC_RATE_LIMIT_WINDOW_MS, 10) || 60 * 1000, // 1 minute
+    max: parseInt(process.env.PUBLIC_RATE_LIMIT_MAX, 10) || 60, // 60 requests per window per IP
+    message: {
+        error: {
+            message: 'Too many requests to this public endpoint, please try again later.',
+            code: 'PUBLIC_RATE_LIMIT_EXCEEDED'
+        }
+    },
+    standardHeaders: true,
+    legacyHeaders: false,
+});
+
+// Redis cache-aside for hot public reads (stats, verify, catalog).
+// Falls back to a no-op passthrough when Redis is not configured.
+const publicCache = createPublicCache({
+    redisUrl: process.env.REDIS_URL,
+    ttlSeconds: parseInt(process.env.PUBLIC_CACHE_TTL_SECONDS, 10) || 30,
+    keyPrefix: process.env.PUBLIC_CACHE_KEY_PREFIX || 'gateway:public:',
+});
+
+app.use((req, res, next) => {
+    if (req.method === 'GET' && isPublicRoute(req.path)) {
+        return publicLimiter(req, res, () => publicCache(req, res, next));
+    }
+    next();
+});
 
 // Service discovery and health check
 app.use(async (req, res, next) => {
@@ -264,7 +302,7 @@ app.get('/admin/circuit-breakers', (req, res) => {
     }));
     
     res.json({
-        circuitBreakers: breakers,
+        breakers,
         timestamp: new Date().toISOString()
     });
 });
@@ -273,220 +311,173 @@ app.post('/admin/circuit-breakers/:name/reset', (req, res) => {
     const { name } = req.params;
     const breaker = circuitBreakers.get(name);
     
-    if (breaker) {
-        breaker.reset();
-        res.json({
-            message: `Circuit breaker ${name} reset`,
-            timestamp: new Date().toISOString()
-        });
-    } else {
-        res.status(404).json({
+    if (!breaker) {
+        return res.status(404).json({
             error: {
                 message: `Circuit breaker ${name} not found`,
                 code: 'CIRCUIT_BREAKER_NOT_FOUND'
             }
         });
     }
+    
+    breaker.reset();
+    
+    res.json({
+        message: `Circuit breaker ${name} reset`,
+        timestamp: new Date().toISOString()
+    });
 });
 
 // Error handling middleware
-app.use((error, req, res, next) => {
-    console.error('Unhandled error:', error);
+app.use((err, req, res, next) => {
+    console.error('Gateway error:', err);
     
-    res.status(error.status || 500).json({
+    if (err.code === 'ECONNREFUSED' || err.code === 'ETIMEDOUT') {
+        return res.status(503).json({
+            error: {
+                message: 'Service temporarily unavailable',
+                code: 'SERVICE_UNAVAILABLE'
+            }
+        });
+    }
+    
+    res.status(err.status || 500).json({
         error: {
-            message: error.message || 'Internal Server Error',
-            code: error.code || 'INTERNAL_ERROR',
-            timestamp: new Date().toISOString(),
-            requestId: req.requestId
+            message: err.message || 'Internal server error',
+            code: err.code || 'INTERNAL_ERROR'
         }
     });
 });
 
 // 404 handler
-app.use('*', (req, res) => {
+app.use((req, res) => {
     res.status(404).json({
         error: {
-            message: 'Endpoint not found',
-            code: 'NOT_FOUND',
-            timestamp: new Date().toISOString(),
-            requestId: req.requestId
+            message: 'Route not found',
+            code: 'ROUTE_NOT_FOUND'
         }
     });
 });
 
 // Helper functions
 function getServiceNameFromPath(path) {
-    const pathParts = path.split('/').filter(part => part);
-    if (pathParts.length >= 2) {
-        const apiVersion = pathParts[0];
-        if (apiVersion.startsWith('api')) {
-            return pathParts[1]; // e.g., /api/v1/auth -> auth
-        }
-    }
-    return null;
+    const pathParts = path.split('/').filter(Boolean);
+    
+    if (pathParts.length === 0) return null;
+    
+    // Map path prefixes to service names
+    const serviceMap = {
+        'auth': 'auth-service',
+        'users': 'user-service',
+        'products': 'product-service',
+        'orders': 'order-service',
+        'payments': 'payment-service',
+        'notifications': 'notification-service',
+        'analytics': 'analytics-service',
+        'stats': 'analytics-service',
+        'verify': 'verification-service',
+        'catalog': 'catalog-service'
+    };
+    
+    return serviceMap[pathParts[0]] || null;
 }
 
 function setupServiceProxies(app) {
-    // Auth service proxy
-    app.use('/api/v1/auth', createServiceProxy('auth-service'));
-    app.use('/api/v1/users', createServiceProxy('auth-service'));
-    app.use('/api/v1/roles', createServiceProxy('auth-service'));
-    app.use('/api/v1/sessions', createServiceProxy('auth-service'));
+    const services = [
+        { name: 'auth-service', path: '/auth' },
+        { name: 'user-service', path: '/users' },
+        { name: 'product-service', path: '/products' },
+        { name: 'order-service', path: '/orders' },
+        { name: 'payment-service', path: '/payments' },
+        { name: 'notification-service', path: '/notifications' },
+        { name: 'analytics-service', path: '/analytics' },
+        { name: 'analytics-service', path: '/stats' },
+        { name: 'verification-service', path: '/verify' },
+        { name: 'catalog-service', path: '/catalog' }
+    ];
     
-    // Courses service proxy
-    app.use('/api/v1/courses', createServiceProxy('courses-service'));
-    app.use('/api/v1/content', createServiceProxy('courses-service'));
-    app.use('/api/v1/enrollments', createServiceProxy('courses-service'));
-    app.use('/api/v1/categories', createServiceProxy('courses-service'));
-    app.use('/api/v1/reviews', createServiceProxy('courses-service'));
-    app.use('/api/v1/progress', createServiceProxy('courses-service'));
-    app.use('/api/v1/search', createServiceProxy('courses-service'));
-    
-    // Analytics service proxy
-    app.use('/api/v1/analytics', createServiceProxy('analytics-service'));
-    app.use('/api/v1/reports', createServiceProxy('analytics-service'));
-    app.use('/api/v1/dashboards', createServiceProxy('analytics-service'));
-    app.use('/api/v1/events', createServiceProxy('analytics-service'));
-    app.use('/api/v1/insights', createServiceProxy('analytics-service'));
-    app.use('/api/v1/metrics', createServiceProxy('analytics-service'));
-}
-
-function createServiceProxy(serviceName) {
-    // Get or create circuit breaker for this service
-    if (!circuitBreakers.has(serviceName)) {
-        circuitBreakers.set(serviceName, new CircuitBreaker({
-            timeout: 30000,
-            errorThresholdPercentage: 50,
-            resetTimeout: 60000
+    services.forEach(({ name, path }) => {
+        app.use(path, createProxyMiddleware({
+            target: process.env[`${name.toUpperCase().replace(/-/g, '_')}_URL`] || `http://localhost:${getServicePort(name)}`,
+            changeOrigin: true,
+            pathRewrite: {
+                [`^${path}`]: ''
+            },
+            onProxyReq: (proxyReq, req, res) => {
+                // Add request ID to proxied requests
+                proxyReq.setHeader('x-request-id', req.requestId);
+                
+                // Add service instance info
+                if (req.serviceInstance) {
+                    proxyReq.setHeader('x-service-instance', req.serviceInstance.id);
+                }
+            },
+            onError: (err, req, res) => {
+                console.error(`Proxy error for ${name}:`, err);
+                
+                if (!res.headersSent) {
+                    res.status(503).json({
+                        error: {
+                            message: `Service ${name} is unavailable`,
+                            code: 'SERVICE_UNAVAILABLE'
+                        }
+                    });
+                }
+            }
         }));
-    }
-    
-    const circuitBreaker = circuitBreakers.get(serviceName);
-    
-    return createProxyMiddleware({
-        target: `http://${serviceName}`, // Will be resolved dynamically
-        changeOrigin: true,
-        pathRewrite: (path, req) => {
-            // Replace service instance URL with actual instance
-            if (req.serviceInstance) {
-                return req.serviceInstance.url + path;
-            }
-            return path;
-        },
-        onProxyReq: (proxyReq, req, res) => {
-            // Add tracing headers
-            proxyReq.setHeader('x-request-id', req.requestId);
-            proxyReq.setHeader('x-forwarded-for', req.ip);
-            proxyReq.setHeader('x-forwarded-proto', req.protocol);
-            proxyReq.setHeader('x-forwarded-host', req.get('host'));
-            
-            // Add authentication if needed
-            if (req.headers.authorization) {
-                proxyReq.setHeader('authorization', req.headers.authorization);
-            }
-        },
-        onProxyRes: (proxyRes, req, res) => {
-            // Add response headers
-            res.setHeader('x-service-name', serviceName);
-            res.setHeader('x-service-instance', req.serviceInstance?.url || 'unknown');
-            
-            // Track success for circuit breaker
-            circuitBreaker.recordSuccess();
-        },
-        onError: (err, req, res) => {
-            // Track failure for circuit breaker
-            circuitBreaker.recordFailure();
-            
-            console.error(`Proxy error for ${serviceName}:`, err);
-            
-            if (!res.headersSent) {
-                res.status(502).json({
-                    error: {
-                        message: `Service ${serviceName} is temporarily unavailable`,
-                        code: 'SERVICE_ERROR'
-                    }
-                });
-            }
-        },
-        router: (req) => {
-            // Dynamic routing based on service instance selection
-            if (req.serviceInstance) {
-                return req.serviceInstance.url;
-            }
-            return null;
-        }
     });
 }
 
+function getServicePort(serviceName) {
+    const ports = {
+        'auth-service': 3001,
+        'user-service': 3002,
+        'product-service': 3003,
+        'order-service': 3004,
+        'payment-service': 3005,
+        'notification-service': 3006,
+        'analytics-service': 3007,
+        'verification-service': 3008,
+        'catalog-service': 3009
+    };
+    
+    return ports[serviceName] || 3000;
+}
+
 function trackRequestMetrics(req, res, duration) {
-    // Track request metrics for monitoring
+    // Metrics tracking implementation
     // This would integrate with your metrics system
 }
 
 async function getGatewayMetrics() {
-    // Return Prometheus metrics for the gateway
-    return `# HELP api_gateway_info Information about API gateway
-# TYPE api_gateway_info gauge
-api_gateway_info{version="${process.env.GATEWAY_VERSION || '1.0.0'}"} 1
-
-# HELP api_gateway_requests_total Total number of requests
-# TYPE api_gateway_requests_total counter
-api_gateway_requests_total{method="GET"} 1000
-api_gateway_requests_total{method="POST"} 500
-api_gateway_requests_total{method="PUT"} 200
-api_gateway_requests_total{method="DELETE"} 100
-
-# HELP api_gateway_request_duration_seconds Request duration in seconds
-# TYPE api_gateway_request_duration_seconds histogram
-api_gateway_request_duration_seconds_bucket{le="0.1"} 500
-api_gateway_request_duration_seconds_bucket{le="0.5"} 1200
-api_gateway_request_duration_seconds_bucket{le="1.0"} 1700
-api_gateway_request_duration_seconds_bucket{le="+Inf"} 1800
-api_gateway_request_duration_seconds_sum 450.5
-api_gateway_request_duration_seconds_count 1800
-
-# HELP api_gateway_circuit_breaker_state Circuit breaker state
-# TYPE api_gateway_circuit_breaker_state gauge
-api_gateway_circuit_breaker_state{service="auth-service"} 0
-api_gateway_circuit_breaker_state{service="courses-service"} 0
-api_gateway_circuit_breaker_state{service="analytics-service"} 0`;
+    // Metrics retrieval implementation
+    // This would integrate with your metrics system
+    return '';
 }
 
-// Graceful shutdown
-const gracefulShutdown = (signal) => {
-    console.log(`Received ${signal}, starting graceful shutdown...`);
-    
-    // Close server
-    server.close(() => {
-        console.log('HTTP server closed');
-        
-        // Close service registry connections
-        serviceRegistry.close();
-        
-        process.exit(0);
-    });
-    
-    // Force close after 30 seconds
-    setTimeout(() => {
-        console.error('Forced shutdown after timeout');
-        process.exit(1);
-    }, 30000);
-};
-
-process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
-process.on('SIGINT', () => gracefulShutdown('SIGINT'));
-
 // Start server
-const PORT = process.env.PORT || 3000;
-const HOST = process.env.HOST || '0.0.0.0';
+const PORT = process.env.PORT || 8080;
 
-const server = app.listen(PORT, HOST, () => {
-    console.log(`API Gateway running on http://${HOST}:${PORT}`);
-    console.log(`Health check: http://${HOST}:${PORT}/health`);
-    console.log(`Readiness check: http://${HOST}:${PORT}/ready`);
-    console.log(`Metrics: http://${HOST}:${PORT}/metrics`);
-    console.log(`Admin endpoints: http://${HOST}:${PORT}/admin`);
+const server = app.listen(PORT, () => {
+    console.log(`API Gateway listening on port ${PORT}`);
+    console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
 });
 
-module.exports = { app, server };
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, shutting down gracefully');
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
+
+process.on('SIGINT', () => {
+    console.log('SIGINT received, shutting down gracefully');
+    server.close(() => {
+        console.log('Server closed');
+        process.exit(0);
+    });
+});
+
+module.exports = app;

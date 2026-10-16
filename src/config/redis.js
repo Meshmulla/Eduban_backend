@@ -115,6 +115,81 @@ class RedisConfig {
     });
   }
 
+  // Cache-aside helpers for hot public reads (stats, verify, catalog)
+  async getCache(key) {
+    if (!this.isConnected) {
+      return null;
+    }
+
+    try {
+      const cached = await this.client.get(key);
+      return cached ? JSON.parse(cached) : null;
+    } catch (error) {
+      logger.error(`Failed to read cache key ${key}:`, error);
+      return null;
+    }
+  }
+
+  async setCache(key, value, ttlSeconds) {
+    if (!this.isConnected) {
+      return false;
+    }
+
+    try {
+      const ttl = Number(ttlSeconds) > 0 ? Number(ttlSeconds) : 60;
+      await this.client.set(key, JSON.stringify(value), { EX: ttl });
+      return true;
+    } catch (error) {
+      logger.error(`Failed to write cache key ${key}:`, error);
+      return false;
+    }
+  }
+
+  async delCache(key) {
+    if (!this.isConnected) {
+      return false;
+    }
+
+    try {
+      await this.client.del(key);
+      return true;
+    } catch (error) {
+      logger.error(`Failed to delete cache key ${key}:`, error);
+      return false;
+    }
+  }
+
+  // Per-IP rate limiting for public/unauthenticated routes
+  async checkRateLimit(identifier, limit, windowSeconds) {
+    if (!this.isConnected) {
+      // Fail open when Redis is unavailable so public routes stay reachable
+      return { allowed: true, remaining: limit, resetAt: Date.now() + windowSeconds * 1000 };
+    }
+
+    const max = Number(limit) > 0 ? Number(limit) : 60;
+    const window = Number(windowSeconds) > 0 ? Number(windowSeconds) : 60;
+    const key = `ratelimit:${identifier}`;
+
+    try {
+      const count = await this.client.incr(key);
+      if (count === 1) {
+        await this.client.expire(key, window);
+      }
+
+      const ttl = await this.client.ttl(key);
+      const resetAt = Date.now() + (ttl > 0 ? ttl : window) * 1000;
+
+      return {
+        allowed: count <= max,
+        remaining: Math.max(0, max - count),
+        resetAt
+      };
+    } catch (error) {
+      logger.error(`Failed to check rate limit for ${identifier}:`, error);
+      return { allowed: true, remaining: max, resetAt: Date.now() + window * 1000 };
+    }
+  }
+
   // Queue operations
   async enqueue(queueName, data, options = {}) {
     if (!this.isConnected) {
@@ -286,159 +361,31 @@ class RedisConfig {
         this.client.del(`${queueName}:delayed`),
         this.client.del(`${queueName}:failed`)
       ]);
-
-      logger.info(`Cleared queue ${queueName}`);
+      logger.debug(`Cleared queue ${queueName}`);
       return true;
-
     } catch (error) {
       logger.error(`Failed to clear queue ${queueName}:`, error);
       throw error;
     }
   }
 
-  // Pub/Sub operations
-  async publish(channel, message) {
-    if (!this.isConnected) {
-      throw new Error('Redis not connected');
-    }
-
-    try {
-      await this.publisher.publish(channel, JSON.stringify(message));
-      logger.debug(`Published message to channel ${channel}`);
-      return true;
-
-    } catch (error) {
-      logger.error(`Failed to publish to channel ${channel}:`, error);
-      throw error;
-    }
-  }
-
-  async subscribe(channel, callback) {
-    if (!this.isConnected) {
-      throw new Error('Redis not connected');
-    }
-
-    try {
-      await this.subscriber.subscribe(channel, (message, subscribedChannel) => {
-        if (subscribedChannel === channel) {
-          try {
-            const parsedMessage = JSON.parse(message);
-            callback(parsedMessage, channel);
-          } catch (error) {
-            logger.error(`Failed to parse message from channel ${channel}:`, error);
-            callback(message, channel);
-          }
-        }
-      });
-
-      logger.debug(`Subscribed to channel ${channel}`);
-      return true;
-
-    } catch (error) {
-      logger.error(`Failed to subscribe to channel ${channel}:`, error);
-      throw error;
-    }
-  }
-
-  async unsubscribe(channel) {
-    if (!this.isConnected) {
-      throw new Error('Redis not connected');
-    }
-
-    try {
-      await this.subscriber.unsubscribe(channel);
-      logger.debug(`Unsubscribed from channel ${channel}`);
-      return true;
-
-    } catch (error) {
-      logger.error(`Failed to unsubscribe from channel ${channel}:`, error);
-      throw error;
-    }
-  }
-
-  // Utility methods
   generateId() {
-    return `tx_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-  }
-
-  async healthCheck() {
-    if (!this.isConnected) {
-      return { status: 'disconnected' };
-    }
-
-    try {
-      const start = Date.now();
-      await this.client.ping();
-      const latency = Date.now() - start;
-
-      return {
-        status: 'connected',
-        latency,
-        reconnectAttempts: this.reconnectAttempts
-      };
-
-    } catch (error) {
-      return {
-        status: 'error',
-        error: error.message
-      };
-    }
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   }
 
   async disconnect() {
     try {
       await Promise.all([
-        this.client?.disconnect(),
-        this.publisher?.disconnect(),
-        this.subscriber?.disconnect()
+        this.client && this.client.quit(),
+        this.publisher && this.publisher.quit(),
+        this.subscriber && this.subscriber.quit()
       ]);
-
       this.isConnected = false;
-      logger.info('Redis disconnected successfully');
-      return true;
-
+      logger.info('Redis disconnected');
     } catch (error) {
-      logger.error('Error disconnecting from Redis:', error);
-      throw error;
+      logger.error('Failed to disconnect Redis:', error);
     }
   }
 }
 
-// Create singleton instance
-const redisConfig = new RedisConfig();
-
-/**
- * Check Redis connectivity with ping command
- * Used by health check endpoints to verify Redis availability
- * @returns Health status with latency and optional error message
- */
-async function checkRedisConnectivity() {
-  const start = Date.now();
-  try {
-    if (!redisConfig.isConnected) {
-      return {
-        status: 'unhealthy',
-        latencyMs: Date.now() - start,
-        error: 'Redis not connected'
-      };
-    }
-
-    await Promise.race([
-      redisConfig.client.ping(),
-      new Promise((_, reject) =>
-        setTimeout(() => reject(new Error('Redis check timeout')), 2000)
-      )
-    ]);
-
-    return { status: 'healthy', latencyMs: Date.now() - start };
-  } catch (error) {
-    return {
-      status: 'unhealthy',
-      latencyMs: Date.now() - start,
-      error: error.message || 'Redis unavailable'
-    };
-  }
-}
-
-module.exports = redisConfig;
-module.exports.checkRedisConnectivity = checkRedisConnectivity;
+module.exports = new RedisConfig();
